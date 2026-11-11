@@ -1,0 +1,223 @@
+name: R2 usage dashboard
+
+# 每天把 Cloudflare R2 免费额度用量写入 EdgeEver 的一条置顶笔记。
+# 该文件位于 Fork 仓库的 .github/workflows/ 下，上游更新器在 mirror 模式下会保留本目录，
+# 因此不会被 Update deployed EdgeEver 覆盖。
+on:
+  schedule:
+    # 01:17 UTC = 09:17 北京时间
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r2-usage-dashboard
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check secrets
+        env:
+          CF_TOKEN: ${{ secrets.CF_R2_ANALYTICS_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          EE_BASE_URL: ${{ secrets.EDGE_EVER_BASE_URL }}
+          EE_TOKEN: ${{ secrets.EDGE_EVER_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for n in CF_TOKEN CF_ACCOUNT_ID EE_BASE_URL EE_TOKEN; do
+            if [ -z "${!n:-}" ]; then
+              echo "::error::缺少仓库 Secret：$n"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "请在 Settings - Secrets and variables - Actions 中补齐后重试。"
+            exit 1
+          fi
+
+      - name: Fetch R2 usage and update EdgeEver note
+        env:
+          CF_TOKEN: ${{ secrets.CF_R2_ANALYTICS_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          EE_BASE_URL: ${{ secrets.EDGE_EVER_BASE_URL }}
+          EE_TOKEN: ${{ secrets.EDGE_EVER_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # ---------- 免费额度常量 ----------
+          FREE_STORAGE_BYTES=10000000000   # 10 GB-month
+          FREE_CLASS_A=1000000             # 100 万次
+          FREE_CLASS_B=10000000            # 1000 万次
+          ALERT_PCT=80                     # 达到 80% 提示
+          WINDOW_DAYS=30
+
+          end_iso=$(date -u +%Y-%m-%dT%H:00:00Z)
+          start_iso=$(date -u -d "${WINDOW_DAYS} days ago" +%Y-%m-%dT%H:00:00Z)
+          now_human=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          gql() {
+            curl -sS --retry 3 --retry-delay 3 -X POST "https://api.cloudflare.com/client/v4/graphql" \
+              -H "Authorization: Bearer ${CF_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data-binary "$1"
+          }
+
+          vars_json=$(jq -nc --arg a "$CF_ACCOUNT_ID" --arg s "$start_iso" --arg e "$end_iso" '{a:$a,s:$s,e:$e}')
+          make_payload() {
+            jq -nc --arg q "$1" --argjson v "$vars_json" '{query:$q,variables:$v}'
+          }
+
+          q_storage='query($a:String!,$s:Time!,$e:Time!){viewer{accounts(filter:{accountTag:$a}){r2StorageAdaptiveGroups(limit:1,filter:{datetime_geq:$s,datetime_leq:$e}){max{payloadSize metadataSize objectCount}}}}}'
+          q_ops='query($a:String!,$s:Time!,$e:Time!){viewer{accounts(filter:{accountTag:$a}){r2OperationsAdaptiveGroups(limit:100,filter:{datetime_geq:$s,datetime_leq:$e}){sum{requests} dimensions{actionType}}}}}'
+          q_bw='query($a:String!,$s:Time!,$e:Time!){viewer{accounts(filter:{accountTag:$a}){r2BandwidthUsageAdaptiveGroups(limit:1,filter:{datetime_geq:$s,datetime_leq:$e}){sum{bytesUpload bytesDownload}}}}}'
+
+          storage_json=$(gql "$(make_payload "$q_storage")")
+          ops_json=$(gql "$(make_payload "$q_ops")")
+          bw_json=$(gql "$(make_payload "$q_bw")")
+
+          # 存储是关键指标：查询失败直接让 job 失败，避免静默显示 0
+          storage_err=$(printf '%s' "$storage_json" | jq -r 'if ((.errors // []) | length) > 0 then (.errors[0].message // "unknown") else empty end' 2>/dev/null || true)
+          if [ -n "$storage_err" ]; then
+            echo "::error::R2 存储用量查询失败：$storage_err"
+            printf '%s\n' "$storage_json"
+            exit 1
+          fi
+
+          read -r storage_bytes meta_bytes object_count <<< "$(printf '%s' "$storage_json" | jq -r '((.data.viewer.accounts[0] // {}).r2StorageAdaptiveGroups[0] // {}) | (.max // {}) | [(.payloadSize // 0), (.metadataSize // 0), (.objectCount // 0)] | @tsv')"
+          storage_bytes=${storage_bytes:-0}
+          meta_bytes=${meta_bytes:-0}
+          object_count=${object_count:-0}
+
+          if printf '%s' "$ops_json" | jq -e '(.errors // []) | length > 0' >/dev/null 2>&1; then
+            echo "::warning::R2 操作数查询返回错误，本次按 0 处理"
+            class_a=0; class_b=0; class_other=0
+          else
+            read -r class_a class_b class_other <<< "$(printf '%s' "$ops_json" | jq -r '
+              ((.data.viewer.accounts[0] // {}).r2OperationsAdaptiveGroups // [])
+              | map({a: (.dimensions.actionType // "unknown"), n: ((.sum.requests // 0) | tonumber)})
+              | reduce .[] as $x ({A:0,B:0,O:0};
+                  if ($x.a | test("^(List|Put|Copy|Create|Upload|Complete|Delete|Abort|Restore)"; "i")) then .A += $x.n
+                  elif ($x.a | test("^(Get|Head)"; "i")) then .B += $x.n
+                  else .O += $x.n end)
+              | [.A, .B, .O] | @tsv')"
+            class_a=${class_a:-0}; class_b=${class_b:-0}; class_other=${class_other:-0}
+          fi
+
+          if printf '%s' "$bw_json" | jq -e '(.errors // []) | length > 0' >/dev/null 2>&1; then
+            echo "::warning::R2 流量查询返回错误，本次按 0 处理"
+            bytes_up=0; bytes_down=0
+          else
+            read -r bytes_up bytes_down <<< "$(printf '%s' "$bw_json" | jq -r '((.data.viewer.accounts[0] // {}).r2BandwidthUsageAdaptiveGroups[0] // {}) | (.sum // {}) | [(.bytesUpload // 0), (.bytesDownload // 0)] | @tsv')"
+            bytes_up=${bytes_up:-0}; bytes_down=${bytes_down:-0}
+          fi
+
+          pct() { awk -v u="$1" -v t="$2" 'BEGIN{ if (t+0 <= 0) {print "0.00"} else {printf "%.2f", (u*100)/t} }'; }
+          fmt_b() { awk -v b="$1" 'BEGIN{ split("B KB MB GB TB", u, " "); i=1; v=b+0; while (v >= 1000 && i < 5) { v/=1000; i++ } if (i == 1) printf "%.0f %s", v, u[i]; else printf "%.2f %s", v, u[i] }'; }
+          status_of() { awk -v p="$1" 'BEGIN{ if (p+0 >= 100) print "已超限"; else if (p+0 >= 80) print "接近上限"; else print "正常" }'; }
+
+          p_storage=$(pct "$storage_bytes" "$FREE_STORAGE_BYTES")
+          p_a=$(pct "$class_a" "$FREE_CLASS_A")
+          p_b=$(pct "$class_b" "$FREE_CLASS_B")
+
+          s_storage=$(status_of "$p_storage")
+          s_a=$(status_of "$p_a")
+          s_b=$(status_of "$p_b")
+
+          alerts=""
+          if awk -v p="$p_storage" -v l="$ALERT_PCT" 'BEGIN{exit !(p+0 >= l)}'; then
+            alerts="${alerts}"$'\n'"- 存储使用率已达 ${p_storage}%（免费额度 10 GB-month），请清理不再需要的附件或大文件。"
+          fi
+          if awk -v p="$p_a" -v l="$ALERT_PCT" 'BEGIN{exit !(p+0 >= l)}'; then
+            alerts="${alerts}"$'\n'"- Class A 写操作使用率已达 ${p_a}%（免费额度 100 万次），请检查是否有异常高频写入。"
+          fi
+          if awk -v p="$p_b" -v l="$ALERT_PCT" 'BEGIN{exit !(p+0 >= l)}'; then
+            alerts="${alerts}"$'\n'"- Class B 读操作使用率已达 ${p_b}%（免费额度 1000 万次），请检查是否有异常高频读取。"
+          fi
+          CONTENT=$(cat <<EOF
+          > Cloudflare R2 免费额度自动监控。本笔记由 GitHub Actions 每日定时覆盖更新，请勿手工编辑正文。
+          >
+          > 统计窗口：${start_iso} 至 ${end_iso}（UTC，最近 ${WINDOW_DAYS} 天）
+          > 更新时间：${now_human}
+          > 数据来源：Cloudflare GraphQL Analytics（与 R2 控制台同源）
+
+          ## 用量总览
+
+          | 项目 | 已用 | 免费额度 | 使用率 | 状态 |
+          | --- | --- | --- | --- | --- |
+          | 存储（区间峰值） | $(fmt_b "$storage_bytes") | 10 GB | ${p_storage}% | ${s_storage} |
+          | Class A 写操作 | ${class_a} | 1,000,000 | ${p_a}% | ${s_a} |
+          | Class B 读操作 | ${class_b} | 10,000,000 | ${p_b}% | ${s_b} |
+
+          ## 明细
+
+          - 对象数量：${object_count}
+          - 元数据占用：$(fmt_b "$meta_bytes")
+          - 出站流量：$(fmt_b "$bytes_down")（出站免费，不计费）
+          - 入站流量：$(fmt_b "$bytes_up")
+          - 未归类操作数：${class_other}
+
+          ## 口径说明
+
+          - 存储额度按 GB-month 计费，官方口径为「账期内每日峰值存储的平均值」。本看板取最近 ${WINDOW_DAYS} 天的区间峰值，口径偏保守（偏高），不会低估用量。
+          - 操作分类规则：List / Put / Copy / Create / Upload / Complete / Delete / Abort 计为 Class A；Get / Head 计为 Class B。
+          - Cloudflare 按单位向上取整计费，因此实际计费量可能略高于此处数字。
+          - 存储桶为空或数据尚未产出时，各项显示 0 属正常现象（R2 用量统计存在数十分钟到数小时的延迟）。
+          EOF
+          )
+
+          if [ -n "$alerts" ]; then
+            CONTENT="${CONTENT}"$'\n'"## 预警"$'\n'"${alerts}"
+            echo "::warning::R2 免费额度已有一项达到 ${ALERT_PCT}% 阈值"
+          fi
+
+          # ---------- 写入 EdgeEver ----------
+          ee() {
+            curl -sS -H "Authorization: Bearer ${EE_TOKEN}" -H "Content-Type: application/json" "$@"
+          }
+
+          NOTE_TITLE="R2 用量看板"
+          query_enc=$(printf '%s' "$NOTE_TITLE" | jq -sRr @uri)
+
+          memo_id=$(ee -X GET "${EE_BASE_URL}/api/v1/memos?limit=50&q=${query_enc}" \
+            | jq -r --arg t "$NOTE_TITLE" '[(.memos // [])[] | select(.title == $t)][0].id // empty')
+
+          if [ -z "$memo_id" ]; then
+            notebook_id=$(ee -X GET "${EE_BASE_URL}/api/v1/notebooks" | jq -r '(.notebooks // [])[0].id // "nb_inbox"')
+            create_body=$(jq -nc --arg nb "$notebook_id" --arg t "$NOTE_TITLE" --arg c "$CONTENT" \
+              '{notebookId:$nb,title:$t,contentMarkdown:$c,tags:["R2","Cloudflare","用量"]}')
+            memo_id=$(ee -X POST "${EE_BASE_URL}/api/v1/memos" --data-binary "$create_body" | jq -r '.memo.id // empty')
+            if [ -z "$memo_id" ]; then
+              echo "::error::在 EdgeEver 中创建笔记失败"
+              exit 1
+            fi
+            echo "已创建笔记：${memo_id}"
+          fi
+
+          session_json=$(ee -X POST "${EE_BASE_URL}/api/v1/memos/${memo_id}/edit-sessions" --data-binary '{}')
+          session_id=$(printf '%s' "$session_json" | jq -r '.editSession.id // empty')
+          base_rev=$(printf '%s' "$session_json" | jq -r '.editSession.baseRevision // 0')
+          base_hash=$(printf '%s' "$session_json" | jq -r '.editSession.baseContentHash // empty')
+
+          if [ -z "$session_id" ] || [ -z "$base_hash" ]; then
+            echo "::error::无法建立笔记编辑会话"
+            printf '%s\n' "$session_json"
+            exit 1
+          fi
+
+          patch_body=$(jq -nc --arg sid "$session_id" --argjson rev "$base_rev" --arg h "$base_hash" --arg c "$CONTENT" \
+            '{editSessionId:$sid,expectedRevision:$rev,expectedContentHash:$h,contentMarkdown:$c,isPinned:true,allowDestructiveOverwrite:true}')
+
+          code=$(ee -X PATCH "${EE_BASE_URL}/api/v1/memos/${memo_id}" --data-binary "$patch_body" -o /tmp/patch.out -w '%{http_code}')
+          if [ "$code" != "200" ]; then
+            echo "::error::更新笔记失败，HTTP ${code}"
+            cat /tmp/patch.out || true
+            exit 1
+          fi
+
+          echo "R2 用量看板已更新：存储 ${p_storage}%，Class A ${p_a}%，Class B ${p_b}%"
